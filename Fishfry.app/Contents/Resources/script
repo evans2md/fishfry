@@ -1,0 +1,686 @@
+### Ver 1.44!
+## Updates:
+# SOLVED BUGS:
+# - Can no longer select empty folder for analysis (prompted to select a new directory)
+# - Correctly finds largest first set of data, correct output (was overriding w each file, only used len of last file)
+#
+# CHANGES:
+# - Walks entire directory, gathers all files
+# - Improved data management- replaced lists with dictionaries, indicies of slopes stored, will ease graph implementation
+# - Tracks slopes beyond end of window, so long as onset was within window
+# - Improved error handling related to user input fields
+# - Improved error handling related to corrupted data files
+# - Changed endWindow to specify end point rather than how far back from end of trial
+# - Removed shock smoothing (requires rework to function as intended with directory walking)
+# - Primitive exclude option, store bad subjects/files in folder named "excl" or starting with "excl"
+#
+## WORKING ON:
+#   * = high priority
+#   *** = current task
+# 
+#   BUGS:
+#
+#   FIXES:
+#
+#   ADD:
+# - Exclude option? 
+#    + Load in subs from directory
+#    + getFile, list of checkboxes, can check files/folders
+# -  Plotting option
+#    + Plot largest slope,areaFill -responseWindow
+#    + Check box window to select which files/folders
+#    + Check box view in fishfry
+#    + Entry field .pdf output name
+#    + Graphs per page (1-4)
+# - Shock smoothing
+#    + Rework UI
+#    + Recheck impact of files smoothed v not
+#    + low priority- previosuly made 0 impact, assuming endWindow is set appropriately shouldn't have effect
+#
+#   CHANGE:
+#
+#
+#    REMOVE:
+
+#1 * * * * * * * *
+#     *Modules
+
+import os # allows program to move between directories
+import bioread # reads .acq data files, by Nate Vack, source: https://github.com/njvack/bioread
+from scipy import signal, stats, interpolate # math for signal filtering and stats
+from scipy.stats import linregress # linear regression
+import numpy as np # math
+import csv # for writing output
+import datetime # for timestamp
+import sys
+
+import Tkinter as tk # GUI
+from Tkinter import *
+import tkMessageBox, tkFileDialog # GUI
+
+import profiles as prf # local file, user parameters
+
+### * * VARIABLES * * ###
+
+## dictionaries
+directories = {'data':str(), # data directory
+               'output':str(),
+               'home':os.getcwd()}
+entry = {} # gui, entry field
+progressBar = {'tracker':0,'max':1};
+eventValue = {}
+tDict = {}
+
+# Default values
+profiles = prf.profiles
+
+#2 * * * * * * * * * * 
+#     *FUNCTIONS 
+
+## Functions for analysis
+
+# get files from path
+# only get if bioread can read
+def getFiles(path):
+    temp = []
+    for f in os.listdir(path): # for files in path
+        if 'excl' not in path: # if file isn't in exclude folder
+            os.chdir(path) # go into folder
+            try:
+                if bioread.read(f): # can bioread read
+                    temp.append(f) # if so, store filename
+            except: # if not
+                pass # do nothing
+    return temp
+    
+# get scr data of trial / when stim present    
+def getSCR(trial,day):
+    temp = []
+    i = -1 # counter
+    for ind,e in enumerate(trial): # get index and element from trial  - necessary?
+        i += 1 # target new array
+        temp.append(day[trial[i]]) # get scr value
+    return temp
+
+# filter scr data
+def scrFilter(sub, fileName,data):
+    # Create an order 3 lowpass butterworth filter
+    b, a = signal.butter(3, 0.05) # signal.butter(order, half power point)
+    try:
+        y = signal.filtfilt(b, a, data) # apply forward-backward filter
+    except ValueError: # store error if unable to
+        try:errorTracker[sub+'/'+fileName].append('Unable to filter data, unicode error')
+        except KeyError:errorTracker[sub+'/'+fileName]=[filename,'Unable to filter data, unicode error']
+        y = []
+    return y
+
+# break list into sequential
+def breakUp(data,trial,start,strictOnset,tDictTrial,tDictFile): # data[trials][value pairs][index,datavalue]
+    temp = []
+    j = -1 # counter for temp, since empty to start set counter back one until space allocated    
+    
+    for ind,i in enumerate(data): # go through each data item, i[0] = index, i[1] = value
+        if i[0] == data[ind-1][0]+1: # if the index is contiguous with the upcoming index, ie sequential
+            temp[j].append(i) # store
+        else:
+            temp.append([]) # create new array (begin new contiguous segment)
+            j += 1 # point to new array
+            temp[j].append(i) # append first item of new segment
+            
+    if (strictOnset and # if strict onset is true
+        temp[0][0][0] == tDictTrial[trial][start]+1 and # and the first item is the first point in the window
+        temp[0][0][1] > tDictFile[trial][start]): # and is larger than the preceding, ie is part of a +slope
+        del temp[0] # delete as onset of slope occured before window
+    return temp
+
+# get segments with positive slope
+def getSlope(data,sampInd,start,end,strictOnset,tDictTrial,tDictFile): # data[datapoint1[index,value],[datapoint2[index,value],...]]
+    temp = []
+    for trial in range(len(data)): #(data and sampInd must be equal length)
+        temp.append([]) # preallocate new array corresponding to the new trial
+        windowData = data[trial][start:end] # set up user-defined response window
+        windowSamp = sampInd[trial][start:end]
+        postWinData = data[trial][end:] # data after window, in case SCR extends beyond end
+        postWinSamp = sampInd[trial][end:]
+        for ind,e in enumerate(windowData): # for each index, element in each datapoint within the window
+            if windowData[ind-1] < e and ind != 0: # if larger than preceeding element - ie positive slope
+                temp[trial].append([windowSamp[ind],windowData[ind]]) # store
+                if ind == len(windowData)-1 and windowData[ind] == temp[trial][-1][1]: #if the last item of windowData, and was stored,
+                    # indicates slope was ascending at end of window, follow past window to find peak
+                    # continue adding until slope no longer positive
+                    for ind,e in enumerate(postWinData): # for each index,element in each datapoint beyond the window
+                        if postWinData[ind-1] < e and ind != 0: # if larger than predeeding element 
+                            temp[trial].append([postWinSamp[ind-1],postWinData[ind-1]]) # add preceding element (ensures contiguous)
+                        elif ind != 0: # if not, and isn't first point
+                            break # stop storing
+        
+        if temp[trial]: # if any segments were found
+            temp[trial] = breakUp(temp[trial],trial,start,strictOnset,tDictTrial,tDictFile) # seperate into discreet chunks for analysis 
+    
+    return temp           
+
+# Get the difference between largest positive slope
+def getDif(data,durReq,minAmp): # data[[trial1[start:end index, start:end value],trial2[...]...,]]
+    temp = []
+    for trial in range(len(data)): # for each trial
+        temp.append([])
+        ii = 0 # pointer
+        for segments in data[trial]: # for each slope segment in each trial
+            if len(segments) > durReq: # if the slope is greater than the duration requirement
+                temp[trial].append([]) # set up array
+                for value in segments:
+                    temp[trial][ii].append(value[1]) # store the value data from the segment (remove index values)
+                try:
+                    temp[trial][ii] = max(temp[trial][ii])-min(temp[trial][ii]) # get the difference
+                except ValueError:
+                    temp[ii] = 0 # if unable to, usually due to no segment to analyze
+                ii += 1 # point to next temp
+        if (temp[trial] == [] or
+            max(temp[trial]) < minAmp): temp[trial] = 0 # if the segment had no positive slopes, or was under the minimum amplitude requirement, store as 0
+        else: temp[trial] = np.sqrt(max(temp[trial])) # otherwise, square root transform the greatest slope and store
+    return temp
+
+# Get the trial indices
+def getTrials(day,eventValue):
+    i = -1 # counter
+    temp = []
+    for ind,e in enumerate(day): # for each index,element in day
+        if e == eventValue: # if current element is equal to trial event value found in data
+            if [day[ind-1],day[ind-2],day[ind-3]] == [0.0,0.0,0.0]: # and preceeding events = 0, eg new trial has started
+                temp.append([]) # preallocate new array for new event
+                i+=1 # use counter to target new array
+            temp[i].append(ind) # append event index
+    return temp
+
+# Get the longest array within an array, used for organizing output
+def getLongest(array):
+    return len(max(array,key=len))
+
+# * * Functions for GUI
+# counts the number of files in a path, used for progress bar
+def countFiles(path):
+    temp = 0
+    for a in os.walk(path): 
+        if 'excl' not in a[0]: # if not in exclude folder
+            os.chdir(a[0])
+            temp += len(getFiles(a[0]))
+    return temp
+
+# * * * * * * * * *
+#   *Analysis
+
+def analysis(strictOnset,startWindow,endWindow,duration,minAmp,saveAs):
+    
+    
+    ## Local functions
+    # get raw scr data
+    def getRaw(sub,fileName):
+        temp = []
+        try:
+            temp = bioread.read(fileName) # try to read the file
+            scrData[sub][fileName] = [] # preallocate
+            scrData[sub][fileName].append([temp.channels[0].data]) # store SCR data (channel 0)
+            scrData[sub][fileName].append([temp.channels[1].data]) # store event data (channel 1)
+        except UnicodeDecodeError: # if unable to read file due to decode errpr
+            try:errorTracker[sub+'/'+fileName].append('Unable to read file, unicode error')
+            except KeyError:errorTracker[sub+'/'+fileName]=[fileName,'Unable to read file, unicode error']
+            print(sub+": Unicode decode error : "+str(fileName))
+        except IndexError: # if unable to read file due to mismatched number of channels
+            try:errorTracker[sub+'/'+fileName].append('Wrong number of channels')
+            except KeyError:errorTracker[sub+'/'+fileName]=[fileName,'Wrong number of channels']
+            print(sub+": Wrong number of channels: "+str(fileName))
+    
+    
+    ## Local variables
+    scr = 0 # pointer
+    pulse = 1 # pointer
+    lDict = {} # length dictionary, used for organizing output
+    errorTracker = {} # tracks errors found during analysis
+    fDict, samplingRates, scrData = {}, {}, {} # dictionaries
+    
+    mainDir = directories['data'] # get the data directory
+    os.chdir(mainDir) # go into it
+    subs =  sorted(filter( # get all folders under data directory
+        lambda a: (a[0]!='/')and('.'not in a),
+            [x[0].replace(mainDir+'/','') for x in os.walk(mainDir)]))
+    if getFiles(mainDir):subs.append('looseFiles') # get any loose files in data directory
+    
+    progressBar['tracker'] = 0 # progress bar, current number of files analyzed
+    progressBar['max'] = countFiles(mainDir) # how many total acknowledge files
+    os.chdir(mainDir) # return to main directory
+
+    ## Set up data for analysis
+    # Pull out raw data, get sampling rates
+    for sub in subs: # for each subject
+    
+        scrData[sub], samplingRates[sub]= {}, {} # create local dictionaries for each subject
+        
+        if sub == 'looseFiles': # if there are loose files
+            subDir = mainDir # the subjects directory is the main directory
+            fDict[sub] = getFiles(subDir) # count how many acq files
+        else:
+            subDir = mainDir+'/'+sub # get subject's directory
+            os.chdir(subDir) # go there
+            fDict[sub] = getFiles(subDir) # get file names of all acq files within subjects folder
+    
+        for fileName in fDict[sub]: # for each subjects File
+            
+            getRaw(sub,fileName) # get raw data
+            
+            try: # get sampling rates
+                samplingRates[sub][fileName] = bioread.read(subDir+'/'+fileName).samples_per_second # call subjects key in sampling rate dictionary add individual file's sampling rate
+            except: # if unable to
+                try:errorTracker[sub+'/'+fileName].append('Unable to read sampling rate')
+                except KeyError:errorTracker[sub+'/'+fileName]=[fileName,'Unable to read sampling rate']
+                print(sub+": can't read sampling rate: "+str(fileName))
+             
+            try: # get event data
+                eventSet = set(scrData[sub][fileName][pulse][0]) # event data should comprise of only two values, trial on (usually 5) or off (usually 0)
+                eventValue[sub] = round(float(filter(lambda a: a!= 0.0, eventSet)[0])) # occasionally event data recorded as long (6+ decimals), casuses issues, round to the tenth instead
+            except UnicodeDecodeError: # decoding error
+                try:errorTracker[sub+'/'+fileName].append('Unable to read data, unicode decode error')
+                except KeyError:errorTracker[sub+'/'+fileName]=[fileName,'Unable to read data, unicode decode error']
+                print(sub+": Unable to read data, unicode decode error: "+str(fileName))
+            except IndexError: # no trials were found, ie the event data is flat throughout the file
+                try:errorTracker[sub+'/'+fileName].append('No trials found')
+                except KeyError:errorTracker[sub+'/'+fileName]=[fileName,'No trials found']
+                print(sub+": no trials found: "+str(fileName))
+        
+        for i in sorted(errorTracker): # check errorTracker for any bad files
+            if sub == i[:len(sub)]: # if any for current subject
+                del scrData[sub][errorTracker[i][0]] # delete the associated files, stored in errorTracker[i][0]
+                fDict[sub].remove(errorTracker[i][0]) # remove from file name dictionary
+                
+        os.chdir('../') # leave subjects directory
+                     
+    ## Start analyzing data 
+    for sub in subs: # for each subject
+        
+        for i,fileName in enumerate(fDict[sub]):
+            i = str(i) # string of index, used for output organization
+            SR = int(samplingRates[sub][fileName]) # call up sampling rate of the current file 
+            
+            # set up parameters using SR
+            if startWindow == 0: start = 0 # set where response window starts
+            else: start = int(startWindow*SR)
+            if endWindow == 0: end = None # and were it ends
+            else: end = int(endWindow*SR)
+    
+            durReq = duration*SR # minimum duration requirement
+        
+            # set up temporary dictionaries for data organization
+            tDict['trial'+fileName] = getTrials(scrData[sub][fileName][pulse][0],eventValue[sub]) # trial data 
+            tDict['data'+fileName] = getSCR(tDict['trial'+fileName],scrFilter(sub,fileName,scrData[sub][fileName][scr][0])) # filtered SCR data
+            
+            tDict['segmentedData'+fileName] = getSlope(tDict['data'+fileName], # segmented data
+                                                       tDict['trial'+fileName],
+                                                       start,end,strictOnset,
+                                                       tDict['trial'+fileName],tDict['data'+fileName])
+            
+            scrData[sub][fileName] = getDif(tDict['segmentedData'+fileName],durReq,minAmp) # difference data
+            
+            try: # set up length dictionary, used for output organization
+                lDict['longest'+i]
+            except KeyError:
+                lDict['longest'+i]=[]
+                
+            lDict['longest'+i].append(scrData[sub][fileName]) # store
+            
+            progressBar['tracker'] += 1 # mark that analysis succesful for file
+            
+            
+        pTxtV.set(str(progressBar['tracker'])+'/'+str(progressBar['max'])+' files analyzed') # update progress bar values
+        master.update() # update GUI display
+        
+    # done with analysis, store output   
+    os.chdir(directories['output']) # go to output directory
+    
+    for key in lDict.keys(): # how deep did the directory walker go
+        lDict[key]=getLongest(lDict[key]) # get the longest file for each level of depth
+        
+    with open(saveAs+'.csv', 'wb') as csv_file: # store output as csv file
+        temp = []
+        writer = csv.writer(csv_file) # create file
+        writer.writerow(sorted(subs)) # write header (subject numbers)
+        for l in range(len(lDict)): # = length of folder with most files
+            fileNames = []
+            for sub in subs: # for each subject
+                try:
+                    fileNames.append(fDict[sub][l]) # store filename for subheader
+                except:
+                    fileNames.append('')
+            writer.writerow([]) # space
+            writer.writerow(fileNames) # write filenames as subheader
+            temp.append([]) 
+            for i in range(lDict['longest'+str(l)]): # for each level 
+                temp[l].append([])
+                for sub in subs: 
+                    try:
+                        temp[l][i].append(scrData[sub][fDict[sub][l]][i]) # get trial data
+                    except IndexError: # file isn't as long as another subjects respective file
+                        temp[l][i].append('') # fill in with blanks to match length     
+                writer.writerow(temp[l][i]) # write to csv file
+                
+                
+    # End analysis message for user
+    endMessage = 'Analysis complete!\n\n The output has been saved at:\n\t '+directories['output']+'\n\n With the name:\n\t '+saveAs+'.csv \n\n'
+
+    eT = len([item for sublist in errorTracker.values() for item in sublist]) # how many errors were found
+    if eT == 1:
+        endMessage += ('The program ran into an error while analyzing a file.\n')
+        for key in errorTracker:
+            endMessage+='\n'+str(key)+' - error:'+str(errorTracker[key][1])+'\n'
+    elif eT > 1:
+        endMessage += ('The program ran into errors while analyzing multiple files:\n')
+        for key in errorTracker:
+            endMessage+='\n'+str(key)+' - error:'+str(errorTracker[key][1:])+'\n'
+    else:
+        endMessage += ('No (obvious) errors were found while running analysis.')
+    if errorTracker.keys():
+        endMessage+='\n\n Unable to analyze the following files:'
+    for i in errorTracker.keys():
+        endMessage+='\n'+str(i)
+    
+    tkMessageBox.showinfo('Completed!', endMessage)
+    
+
+## Functions for GUI
+# get directories
+def getDir(a): 
+    if a == 0: # 0 = data directory
+        directories['data'] = tkFileDialog.askdirectory()
+        if directories['data'] != '':
+            dirTxt.config(text='...'+directories['data'][-25:]) # display the last 25 characters
+            pwd = os.getcwd()
+            progressBar['max'] = countFiles(directories['data']) # count files for progress bar
+            pTxtV.set('0/'+str(progressBar['max'])+' files analyzed') # update progress bar values
+            master.update() # update GUI display
+    if a == 1: # 1 = output directory
+        directories['output'] = tkFileDialog.askdirectory()
+        if directories['output'] != '':
+            fileDirTxt.config(text='...'+directories['output'][-25:])
+            
+# refresh values when new user profile selected       
+def refresh(a): 
+    profile = variable.get()
+    strictOnsetVar.set(str(profiles[profile]['strictOnset']))
+    startWindowE.delete(0,END)
+    startWindowE.insert(0,profiles[profile]['startWindow'])
+    endWindowE.delete(0,END)
+    endWindowE.insert(0,profiles[profile]['endWindow'])
+    durationE.delete(0,END)
+    durationE.insert(0,profiles[profile]['duration'])
+    minAmpE.delete(0,END)
+    minAmpE.insert(0,profiles[profile]['minAmp'])
+    
+# UI error message handling    
+def errorMessage(errors):
+    message = 'Check entry/entries for:\n'
+    for sub in errors:
+        message += '\t\t\t'+str(sub)+'\n'
+        
+    tkMessageBox.showerror('Error',message)
+
+# edit profiles    
+def newProfile():
+    
+    def exportProfile():
+        newEntry = {}
+        profileDir = prf.__file__[:-12]
+        pwd = os.getcwd()
+        
+        if entryAdd.cget('state') == 'normal':
+            print 'checkbox checked'
+            newName = entryAdd.get() # new profile name
+            newEntry[newName]=dict( # new profile values
+                strictOnset = strictOnsetVar.get(),
+                startWindow = startWindowE.get(),
+                endWindow = endWindowE.get(),
+                duration = durationE.get(),
+                minAmp = minAmpE.get()
+            )
+        
+            os.chdir(profileDir) # go into profiles.py directory
+            
+            with open('profiles.py', 'a+') as f: # open profiles.py to update
+                print 'writing new profile '+newName
+                f.write("\n\nprofiles['"+str(newName)+"'] = dict(") # write profile name
+                for ind,e in enumerate(newEntry[newName]): # write profile values
+                    f.write('\n\t'+str(e)+' = '+str(newEntry[newName][e]))
+                    if ind < len(newEntry[newName])-1:
+                        f.write(',')
+                f.write('\n)') # linebreak
+            os.chdir(pwd) # return to previous working directory
+    
+        # removing a profile
+        if len(profiles.keys()) > 1: # if there are profiles to remove (leave one, default)
+            if userProfileM.cget('state') == 'normal':
+                deleteMe = variableRem.get() # which profile to delete
+                print 'removing profile'
+            
+                os.chdir(profileDir) # go into profile.py directory
+                with open('profiles.py', 'r') as f: # open profile.py
+                    l = f.readlines() # copy it
+                    f.close() # close it
+                
+                    f = open('profiles.py', 'w') # reopen
+                    for ind,line in enumerate(l): # rewrite
+                        if deleteMe in line: # but omit lines associated with profile to be deleted
+                            skip = range(ind,ind+8)
+                    try:
+                        skip
+                    except:
+                        skip = float('nan')
+                
+                    for ind,line in enumerate(l):
+                        if type(skip) == list:
+                            if ind not in skip:
+                                f.write(line)
+                        else: f.write(line)
+                    f.close()
+                    print deleteMe+' profile deleted!'
+            
+        profileWin.destroy() # close edit profile window
+        
+    # allow access to UI field
+    def allowEntry(a):
+        if a == 'add': # adding a profile
+            print 'entry allowed'
+            if entryAdd.cget('state') == 'disabled':
+                entryAdd.config(state='normal')
+            else:
+                entryAdd.config(state='disabled')
+        if a == 'rem': # removing a profile
+            if userProfileM.cget('state') == 'disabled':
+                userProfileM.config(state='normal')
+            else:
+                userProfileM.config(state='disabled')
+    
+    # set up profile window      
+    profileWin = Tk()
+    profileWin.winfo_toplevel().title('Manage Profiles')
+    profileWin.config(padx=20, pady=15)
+    
+    f1 = tk.Frame(profileWin)
+    f1.pack(anchor=W, fill=X)
+    instructions =('To add the current values as a new profile, check the corresponding '
+                   +'checkbox and enter the desired name of the new profile.\n\n'
+                   +'To remove, check the corresponding checkbox and select the profile you wish '
+                   +'to remove.\n\n'
+                   +'You may do both simultaneously. Changes will be reflected next time you launch FishFry.\n')
+    Label(f1, text=instructions, wraplength= 300).pack(pady=10) # instructions
+    
+    # Add Profile line
+    f2 = tk.Frame(profileWin)
+    f2.pack(anchor=W, fill=X)
+    checkVarAdd = BooleanVar()
+    checkBAdd = Checkbutton(f2, text='Add: ', variable=checkVarAdd, command=lambda: allowEntry('add'))
+    #checkBAdd.config() #change to enable entry
+    checkBAdd.pack(side=LEFT,padx=25)
+    entryAdd = Entry(f2, state=DISABLED)
+    entryAdd.pack(side=LEFT)
+        
+    # Remove Profile line
+    # User Profile drop down
+    if len(profiles.keys()) > 1:
+        options = sorted(filter(lambda a: a!=' Default', profiles.keys()))
+        variableRem = StringVar(profileWin)
+        variableRem.set(options[0])
+
+        f3 = tk.Frame(profileWin)
+        f3.pack(anchor=W, fill=X)
+        checkVarRem = BooleanVar()
+        checkBRem = Checkbutton(f3, text='Remove: ', variable= checkVarRem, command= lambda: allowEntry('rem'))
+        checkBRem.pack(side=LEFT, padx=25)
+        userProfileM = OptionMenu(f3, variableRem, *options)
+        userProfileM.config(state='disabled')
+        userProfileM.pack(side=LEFT)
+    
+    f4 = tk.Frame(profileWin)
+    f4.pack(anchor=W, fill=X, padx=75, pady=10)
+    Button(f4, text='Save', command=exportProfile).pack(side=LEFT, ipadx=25)
+    Button(f4, text='Cancel', command=profileWin.destroy).pack(side=LEFT, ipadx=25)
+    
+# check if entries suitable for analysis
+def checkEntries():
+    errors = []
+    
+    entries = [[startWindowL.cget('text'), startWindowE.get()], # get all user defined parameters
+            [endWindowL.cget('text'),endWindowE.get()],
+            [durationL.cget('text'),durationE.get()],
+            [minAmpL.cget('text'),minAmpE.get()]]
+    
+    subs =  sorted(filter( # count subs
+        lambda a: (a[0]!='/')and('.'not in a),
+            [x[0].replace(directories['data']+'/','') for x in os.walk(directories['data'])]))
+    
+    for entry in range(len(entries)):
+        try:
+            entries[entry][1] = float(entries[entry][1]) # try to transform to float
+        except ValueError:
+            errors.append(entries[entry][0])
+            
+    if directories['data'] == '': # if didn't specify data directory
+        errors.append(['Where should I start?','Please select which directory to analyze.'])
+    else: # if specified...
+        os.chdir(directories['data'])
+        if len(subs) < 1: # but no subjects in folder
+            errors.append(['Empty folder','No data files found in selected directory. Please select another directory to analyze.'])
+    if directories['output'] == '': # if didn't to specify output directory
+        errors.append(['Where should I finish?','Please select which directory to store the output.'])
+        
+    if errors: # if any errors 
+        for error in errors:
+            tkMessageBox.showerror(error[0],error[1]) # show em
+        return errors 
+    else:
+        getEntries(entries) # if no errors, proceed 
+
+# gather user defined entry values
+def getEntries(values):
+    errors = []
+    for entry in values: # for each entry
+        if type(entry[1]) is not float or entry[1] < 0: # if isn't a float or is empty
+            errors.append(entry[0]) # store as error
+    if errors: # if any errors
+        errorMessage(errors) # show em
+    else:
+        if fileNameE.get(): # if specified output filename
+            saveAs = fileNameE.get()
+        else: # otherwise use timestamp
+            saveAs = (str(datetime.datetime.now()).split('.')[0][5:-3]).replace(':','')
+        analysis(strictOnsetVar.get(), # execute analysis function
+                 float(startWindowE.get()),
+                 float(endWindowE.get()),
+                 float(durationE.get()),
+                 float(minAmpE.get()),
+                 saveAs)
+        
+# set up GUI
+master = Tk()
+master.winfo_toplevel().title('FishFry! v1.44')
+master.config(padx=20, pady=40)
+master.grid_columnconfigure(0, weight=1)
+master.grid_rowconfigure(0, weight=1)
+
+
+# User Profile drop down
+options = sorted(profiles.keys())
+variable = StringVar(master)
+variable.set(options[0])
+userProfileM = OptionMenu(master, variable, *options, command=refresh)
+
+# Boolean drop down
+tfOptions = ['True','False']
+tfVariable = StringVar(master)
+#tfVariable.set(tfOptions[0])
+
+## Left side ( mostly labels)
+Label(master, text='Directory to analyze:').grid(row=2,sticky=W)
+
+Label(master, text='User Profile:').grid(row=4,sticky=W)
+Label(master, text='Strict Onset:').grid(row=5,sticky=W,padx=15)
+startWindowL = Label(master, text='Response Window Start')
+startWindowL.grid(row=6,sticky=W,padx=15)
+endWindowL = Label(master, text='Response Window End')
+endWindowL.grid(row=7,sticky=W,padx=15)
+durationL = Label(master, text='Duration')
+durationL.grid(row=8,sticky=W,padx=15)
+minAmpL = Label(master, text='Minimum Amplitude')
+minAmpL.grid(row=9,sticky=W,padx=15)
+
+Label(master, text='Output').grid(row=10,sticky=W)
+Label(master, text='File Name').grid(row=11,sticky=W, padx=15)
+Label(master, text='Directory').grid(row=12,sticky=W, padx=15)
+
+## Right side (user defined)
+dirBut = Button(master, text='Select Folder', command=lambda:getDir(0))
+dirBut.grid(row=3, column=2)
+
+dirTxt = Label(master, text='???')
+dirTxt.grid(row=2,column = 2)
+
+profile = variable.get()
+userProfileM.grid(row=4, column=2, sticky=W)
+
+addProfileB = Button(master, text='Edit', command=newProfile)
+addProfileB.grid(row=4,column=2, sticky=E)
+
+strictOnsetVar = StringVar(master)
+strictOnsetVar.set(str(profiles[profile]['strictOnset']))
+strictOnsetM = OptionMenu(master, strictOnsetVar, *tfOptions)
+strictOnsetM.grid(row=5, column=2, sticky=W)
+
+startWindowE = Entry(master)
+startWindowE.grid(row=6, column=2, sticky = W)
+startWindowE.insert(0,profiles[profile]['startWindow'])
+
+endWindowE = Entry(master)
+endWindowE.grid(row=7, column=2, sticky = W)
+endWindowE.insert(0,profiles[profile]['endWindow'])
+
+durationE = Entry(master)
+durationE.grid(row=8, column=2, sticky = W)
+durationE.insert(0,profiles[profile]['duration'])
+
+minAmpE = Entry(master)
+minAmpE.grid(row=9, column=2, sticky = W)
+minAmpE.insert(0,profiles[profile]['minAmp'])
+
+fileNameE = Entry(master)
+fileNameE.grid(row=11, column=2, sticky = W)
+
+fileDirTxt = Label(master, text='???')
+fileDirTxt.grid(row=12,column = 2)
+
+fileDirBut = Button(master, text='Select Folder', command=lambda:getDir(1))
+fileDirBut.grid(row=13, column=2)
+
+pTxtV = StringVar()
+pTxtV.set('0/0 files analyzed')
+progressTxt = Label(master, textvariable=pTxtV).grid(row=17,column = 2, sticky=W, pady=20)
+    
+Button(master, text='Analyze', command=lambda:checkEntries()).grid(row=19,column = 0, sticky=E, pady=20)
+Button(master, text='Quit', command=master.quit).grid(row=19,column = 2, sticky=W, pady=20)
+
+mainloop()

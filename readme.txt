@@ -8,7 +8,7 @@ contact: evans2md@gmail.com
 
 FishFry is a light-weight python program designed to read electrodermal activity recordings (EDA/SCR/GSR) recorded by Biopac acqKnowledge and output a .csv file. Currently the desktop app is designed only for Mac Os, however the script can be executed on Linux machines via terminal.
 
-FishFry is intended to be used in research studies that measure EDA responses. The expected input is a 2-channel AcqKnowledge file, with one channel containing the SCR raw data, and a second channel denoting trial periods. FishFry output a .csv with square root transformed trough-to-peak amplitudes for each trial, for each file (e.g run), for each folder (e.g. subject) within a specified directory.
+FishFry is intended to be used in research studies that measure EDA responses. The expected input is a 2-channel AcqKnowledge file, with one channel containing the SCR raw data, and a second channel denoting trial periods. FishFry outputs a .csv with square root transformed trough-to-peak amplitudes for each trial, for each file (e.g run), for each folder (e.g. subject) within a specified directory.
 
 To run:
 
